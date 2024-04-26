@@ -4,7 +4,7 @@ locals {
 }
 
 module "database" {
-  source = "./modules/aws-rds" # git@github.com:klimantovich/itransition-devops-tasks.git//Terraform/Terraform-modules/aws-rds
+  source = "git@github.com:klimantovich/itransition-devops-tasks.git"
 
   environment = var.environment
 
