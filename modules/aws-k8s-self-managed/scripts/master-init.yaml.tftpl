@@ -1,0 +1,148 @@
+#cloud-config
+
+package_update: true
+package_upgrade: true
+packages:
+  - awscli
+  - jq
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gnupg2
+  - openssl
+  - software-properties-common
+  - gpg
+
+write_files:
+  - path: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+    append: true
+  - path: /etc/sysctl.d/k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+    append: true
+  - path: /etc/kubernetes/kubeadm-config.yaml
+    content: |
+      apiVersion: kubeadm.k8s.io/v1beta3
+      kind: InitConfiguration
+      localAPIEndpoint:
+        advertiseAddress: ${advertiseAddress}
+        bindPort: ${apiserver_port}
+      nodeRegistration:
+        criSocket: unix:///var/run/crio/crio.sock
+        imagePullPolicy: IfNotPresent
+        taints: null
+      ---
+      apiVersion: kubeadm.k8s.io/v1beta3
+      kind: ClusterConfiguration
+      apiServer:
+        timeoutForControlPlane: 4m0s
+      certificatesDir: /etc/kubernetes/pki
+      clusterName: kubernetes
+      controlPlaneEndpoint: ${control_plane_endpoint}:${apiserver_port}
+      imageRepository: registry.k8s.io
+      kubernetesVersion: ${kubernetes_version}.0
+      networking:
+        dnsDomain: cluster.local
+        podSubnet: ${pod_subnet_cidr}
+        serviceSubnet: ${service_subnet_cidr}
+      scheduler: {}
+  %{ if install_ingress_controller }
+  - path: /etc/kubernetes/ingress-controller.yaml
+    content: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        labels:
+          app.kubernetes.io/component: controller
+          app.kubernetes.io/instance: ingress-nginx
+          app.kubernetes.io/name: ingress-nginx
+          app.kubernetes.io/part-of: ingress-nginx
+        name: ingress-nginx-controller
+        namespace: ingress-nginx
+      spec:
+        ipFamilies:
+        - IPv4
+        ipFamilyPolicy: SingleStack
+        ports:
+        - appProtocol: http
+          name: http
+          port: 80
+          protocol: TCP
+          targetPort: http
+          nodePort: ${ingress_http_nodePort}
+        - appProtocol: https
+          name: https
+          port: 443
+          protocol: TCP
+          targetPort: https
+          nodePort: ${ingress_https_nodePort}
+        selector:
+          app.kubernetes.io/component: controller
+          app.kubernetes.io/instance: ingress-nginx
+          app.kubernetes.io/name: ingress-nginx
+        type: NodePort
+  %{ endif }
+
+runcmd:
+  - swapoff -a
+  - sed -i '/swap/d' /etc/fstab
+  - mount -a
+  - ufw disable
+  - modprobe overlay
+  - modprobe br_netfilter
+  - sysctl --system
+  # Install Container Runtime (CRI-O)
+  - export OS=xUbuntu_22.04
+  - echo "deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/$OS/ /"| sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
+  - echo "deb http://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/${crio_version}/$OS/ /"|sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:stable:cri-o:${crio_version}.list
+  - curl -L https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable:cri-o:${crio_version}/$OS/Release.key | sudo apt-key --keyring /etc/apt/trusted.gpg.d/libcontainers.gpg add -
+  - curl -L https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/$OS/Release.key | sudo apt-key --keyring /etc/apt/trusted.gpg.d/libcontainers.gpg add -
+  - apt-get update
+  - apt-get install -y cri-o cri-o-runc cri-tools
+  - systemctl daemon-reload
+  - systemctl start crio
+  - systemctl enable crio
+  # Install Kubernetes Tools
+  - curl -fsSL https://pkgs.k8s.io/core:/stable:/v${kubernetes_version}/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  - echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${kubernetes_version}/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+  - apt-get update
+  - apt-get install -y kubelet kubeadm kubectl
+  - apt-mark hold kubelet kubeadm kubectl
+  - systemctl enable --now kubelet
+  # Init Kubernetes Cluster Using Kubeadm
+  - kubeadm init --upload-certs --config=/etc/kubernetes/kubeadm-config.yaml
+  - export KUBECONFIG=/etc/kubernetes/admin.conf
+  # Setup CNI (cilium)
+  - CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+  - CLI_ARCH=amd64
+  - export XDG_CACHE_HOME=/root
+  - if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
+  - curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/$CILIUM_CLI_VERSION/cilium-linux-$CLI_ARCH.tar.gz{,.sha256sum}
+  - sha256sum --check cilium-linux-$CLI_ARCH.tar.gz.sha256sum
+  - sudo tar xzvfC cilium-linux-$CLI_ARCH.tar.gz /usr/local/bin
+  - rm cilium-linux-$CLI_ARCH.tar.gz{,.sha256sum}
+  - cilium install --wait
+  # Setup Ingress Controller (if corresponding var is set)
+  %{ if install_ingress_controller }
+  - kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.10.0/deploy/static/provider/baremetal/deploy.yaml
+  - kubectl apply -f /etc/kubernetes/ingress-controller.yaml
+  - sleep 60
+  - kubectl delete validatingwebhookconfiguration ingress-nginx-admission
+  %{ endif }
+  # Set Cluster Secrets
+  - export AWS_DEFAULT_REGION=${aws_default_region}
+  - export CA_HASH=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //')
+  - export TOKEN=$(kubeadm token create)
+  - export CERTIFICATE_KEY=$(kubeadm init phase upload-certs --upload-certs | tail -n 1)
+  - aws secretsmanager update-secret --secret-id ${kubeadm_ca_secret_name} --secret-string "$(cat /etc/kubernetes/pki/ca.crt)"
+  - aws secretsmanager update-secret --secret-id ${kubeadm_ca_hash_secret_name} --secret-string $CA_HASH
+  - aws secretsmanager update-secret --secret-id ${kubeadm_certificate_key_secret_name} --secret-string $CERTIFICATE_KEY
+  - aws secretsmanager update-secret --secret-id ${kubeadm_token_secret_name} --secret-string $TOKEN
+  - aws secretsmanager update-secret --secret-id ${kubeconfig_secret_name} --secret-string "$(cat /etc/kubernetes/admin.conf)"
+
+

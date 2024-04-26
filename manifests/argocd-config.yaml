@@ -1,0 +1,17 @@
+---
+configs:
+  repositories:
+    repo1:
+      url: https://github.com/klimantovich/us-west-1-cluster
+      name: gym-management
+      type: git
+# server:
+#   service:
+#     annotations:
+#       service.beta.kubernetes.io/aws-load-balancer-type: nlb
+#     type: LoadBalancer
+#     servicePortHttpsAppProtocol: HTTPS
+# global:
+#   networkPolicy:
+#     # -- Create NetworkPolicy objects for all components
+#     create: true
