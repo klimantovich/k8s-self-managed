@@ -1,0 +1,76 @@
+#cloud-config
+
+package_update: true
+package_upgrade: true
+packages:
+  - haproxy
+
+write_files:
+  - path: /etc/cluster-key.pem
+    content: ${cluster_key}
+  - path: /tmp/wait_kubeconfig.sh
+    permissions: 0755
+    content: |
+      #!/bin/bash
+      ssh -i /root/cluster-key.pem -o StrictHostKeyChecking=no ubuntu@${init_node_ip} "test -e /tmp/admin.conf"
+      while [[ $? != 0 ]]
+      do
+        echo "Waiting For Kubeconfig..."
+        sleep 10
+        ssh -i /root/cluster-key.pem -o StrictHostKeyChecking=no ubuntu@${init_node_ip} "test -e /tmp/admin.conf"
+      done
+  - path: /tmp/haproxy.cfg
+    owner: haproxy:haproxy
+    permissions: "0644"
+    append: true
+    content: |
+      frontend kube-apiserver
+        bind *:${apiserver_port}
+        mode tcp
+        option tcplog
+        default_backend kube-apiserver
+      backend kube-apiserver
+        mode tcp
+        option tcp-check
+        balance roundrobin
+        %{ for index, node_ip in master_nodes_ips ~}
+        server k8s-master-${index} ${node_ip}:${apiserver_port} check fall 3 rise 2
+        %{ endfor ~}
+      %{ if install_ingress_controller }
+      frontend ingress-controller-http
+        bind *:80
+        mode tcp
+        option tcplog
+        default_backend ingress-controller-http
+      backend ingress-controller-http
+        mode tcp
+        option tcp-check
+        balance roundrobin
+        %{ for index, node_ip in cluster_nodes_ips ~}
+        server k8s-node-${index} ${node_ip}:${ingress_http_nodePort} check fall 3 rise 2
+        %{ endfor ~}
+      frontend ingress-controller-https
+        bind *:443
+        mode tcp
+        option tcplog
+        default_backend ingress-controller-https
+      backend ingress-controller-https
+        mode tcp
+        option tcp-check
+        balance roundrobin
+        %{ for index, node_ip in cluster_nodes_ips ~}
+        server k8s-node-${index} ${node_ip}:${ingress_https_nodePort} check fall 3 rise 2
+        %{ endfor ~}
+      %{ endif }
+
+runcmd:
+  - cp /tmp/haproxy.cfg /etc/haproxy/haproxy.cfg
+  - systemctl daemon-reload
+  - systemctl enable haproxy
+  - systemctl restart haproxy
+  # Wait for Kubeconfig and get CA Certificate
+  - base64 -d /etc/cluster-key.pem > /root/cluster-key.pem
+  - chmod 400 /root/cluster-key.pem
+  - /tmp/wait_kubeconfig.sh
+  - scp -i /root/cluster-key.pem -o StrictHostKeyChecking=no ubuntu@${init_node_ip}:/tmp/admin.conf /tmp/kubeconfig.conf
+  - scp -i /root/cluster-key.pem -o StrictHostKeyChecking=no ubuntu@${init_node_ip}:/tmp/ca.crt /tmp/ca.crt
